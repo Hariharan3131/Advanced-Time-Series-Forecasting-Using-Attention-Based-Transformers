@@ -1,351 +1,208 @@
-import time
-import math
+import os, random, time
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from statsmodels.tsa.statespace.sarimax import SARIMAX
+import pandas as pd
+import matplotlib.pyplot as plt
 
 
-
-def generate_synthetic_series(T=5000, seed=42):
-
-    rng = np.random.default_rng(seed)
-    t = np.arange(T)
-
-    series = (
-        1.0 * np.sin(2 * np.pi * t / 50) +      
-        0.5 * np.sin(2 * np.pi * t / 200) +   
-        0.2 * np.sin(2 * np.pi * t / 1000)      
-    )
-
- 
-    trend = 0.0005 * t
-    noise = rng.normal(0, 0.2, size=T)
-
-    data = series + trend + noise
-    return data.astype(np.float32)
+SEED = 42
+os.environ["PYTHONHASHSEED"] = str(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
 
 
+from statsmodels.datasets import get_rdataset
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.inspection import permutation_importance
+from sklearn.base import BaseEstimator
 
-class TimeSeriesWindowDataset(Dataset):
-    def __init__(self, series, seq_len=60, horizon=1):
-        self.series = series
-        self.seq_len = seq_len
-        self.horizon = horizon
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.optimizers import Adam
 
-        self.X = []
-        self.y = []
-
-        for i in range(len(series) - seq_len - horizon + 1):
-            window = series[i : i + seq_len]
-            target = series[i + seq_len + horizon - 1]
-            self.X.append(window)
-            self.y.append(target)
-
-        self.X = np.stack(self.X)
-        self.y = np.array(self.y)  
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        x = self.X[idx]          
-        y = self.y[idx]         
-        x = torch.tensor(x).unsqueeze(-1)   
-        y = torch.tensor(y).float()
-        return x, y
+import shap
 
 
-class PositionalEncoding(nn.Module):
+data = get_rdataset("AirPassengers").data
+df = pd.DataFrame({
+    "Month": pd.date_range(start="1949-01-01", periods=len(data["value"]), freq="MS"),
+    "Passengers": data["value"].astype(float)
+})
+df.set_index("Month", inplace=True)
 
-    def __init__(self, d_model, max_len=5000):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)  
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
-        self.register_buffer("pe", pe)
-
-    def forward(self, x):
-
-        seq_len = x.size(1)
-        x = x + self.pe[:, :seq_len, :]
-        return x
+df["lag1"] = df["Passengers"].shift(1)
+df["lag12"] = df["Passengers"].shift(12)
+df["month"] = df.index.month
+df["trend"] = np.arange(len(df))
+df = df.dropna().copy()
 
 
-class MultiHeadSelfAttention(nn.Module):
+n = len(df)
+train_end = int(n * 0.7)
+valid_end = train_end + int(n * 0.15)
 
-    def __init__(self, d_model, num_heads, dropout=0.1):
-        super().__init__()
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
+train = df.iloc[:train_end]
+valid = df.iloc[train_end:valid_end]
+test = df.iloc[valid_end:]
 
-        self.W_q = nn.Linear(d_model, d_model, bias=False)
-        self.W_k = nn.Linear(d_model, d_model, bias=False)
-        self.W_v = nn.Linear(d_model, d_model, bias=False)
-        self.W_o = nn.Linear(d_model, d_model, bias=False)
-
-        self.softmax = nn.Softmax(dim=-1)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, mask=None):
-
-        B, L, D = x.size()
+print("Sizes -> train, valid, test:", len(train), len(valid), len(test))
 
 
-        Q = self.W_q(x)
-        K = self.W_k(x)
-        V = self.W_v(x)
+scaler = MinMaxScaler()
+train_scaled = scaler.fit_transform(train)
+valid_scaled = scaler.transform(valid)
+test_scaled = scaler.transform(test)
 
-        Q = Q.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
-        K = K.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
-        V = V.view(B, L, self.num_heads, self.d_k).transpose(1, 2)
+def create_sequences(arr, window=12):
+    X, y = [], []
+    for i in range(window, len(arr)):
+        X.append(arr[i-window:i])
+        y.append(arr[i, 0])  # passengers is column 0
+    return np.array(X), np.array(y)
 
-        scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_k)  
+WINDOW = 12
+X_train, y_train = create_sequences(train_scaled, WINDOW)
+X_valid, y_valid = create_sequences(valid_scaled, WINDOW)
+X_test, y_test = create_sequences(test_scaled, WINDOW)
 
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-
-        attn = self.softmax(scores) 
-        attn = self.dropout(attn)
-        context = attn @ V  # (B, h, L, d_k)
+print("Sequence shapes:", X_train.shape, X_valid.shape, X_test.shape)
 
 
-        context = context.transpose(1, 2).contiguous().view(B, L, D)  # (B, L, D)
+tf.keras.backend.clear_session()
+model = Sequential([
+    LSTM(32, return_sequences=False, input_shape=(WINDOW, train_scaled.shape[1])),
+    Dropout(0.2),
+    Dense(1)
+])
+model.compile(optimizer=Adam(learning_rate=0.005), loss="mse", metrics=["mae"])
 
- 
-        out = self.W_o(context)
+es = EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True, verbose=0)
+t0 = time.time()
+model.fit(X_train, y_train, validation_data=(X_valid, y_valid),
+          epochs=100, batch_size=8, callbacks=[es], verbose=0)
+print("Training time: {:.1f}s".format(time.time() - t0))
+
+
+pred_test_scaled = model.predict(X_test, verbose=0).reshape(-1,1)
+pad = np.zeros((len(pred_test_scaled), train_scaled.shape[1]-1))
+pred_test_full = np.hstack((pred_test_scaled, pad))
+pred_test = scaler.inverse_transform(pred_test_full)[:, 0]
+
+y_test_full = np.hstack((y_test.reshape(-1,1), np.zeros((len(y_test), train_scaled.shape[1]-1))))
+y_test_actual = scaler.inverse_transform(y_test_full)[:, 0]
+
+rmse = np.sqrt(mean_squared_error(y_test_actual, pred_test))
+mae = mean_absolute_error(y_test_actual, pred_test)
+print(f"Test RMSE: {rmse:.3f}, MAE: {mae:.3f}")
+
+
+plt.figure(figsize=(9,4))
+test_dates_for_pred = test.index[WINDOW:]
+plt.plot(df.index, df["Passengers"], label="All (actual)", linewidth=1)
+plt.plot(test_dates_for_pred, pred_test, label="LSTM pred (test)", linestyle="--")
+plt.legend(); plt.title("Simple LSTM Predictions"); plt.grid(alpha=0.3); plt.tight_layout()
+plt.show()
+
+
+class LSTMWrapper(BaseEstimator):
+    def __init__(self, model, scaler, n_features, window):
+        self.model = model
+        self.scaler = scaler
+        self.n_features = n_features
+        self.window = window
+    def fit(self, X, y):
+        return self
+    def predict(self, X_flat):
+        X3 = X_flat.reshape(-1, self.window, self.n_features)
+        p = self.model.predict(X3, verbose=0)
+        full = np.hstack((p.reshape(-1,1), np.zeros((len(p), self.n_features-1))))
+        return self.scaler.inverse_transform(full)[:, 0]
+
+X_valid_flat = X_valid.reshape(X_valid.shape[0], -1)
+y_valid_actual = scaler.inverse_transform(
+    np.hstack((y_valid.reshape(-1,1), np.zeros((len(y_valid), train_scaled.shape[1]-1))))
+)[:, 0]
+
+wrapper = LSTMWrapper(model, scaler, train_scaled.shape[1], WINDOW)
+print("Computing permutation importance (may take ~10-30s)...")
+perm = permutation_importance(wrapper, X_valid_flat, y_valid_actual,
+                              scoring="neg_mean_squared_error", n_repeats=5, random_state=SEED, n_jobs=1)
+
+feat_names = list(train.columns)
+n_feat = len(feat_names)
+flat_len = perm.importances_mean.shape[0]
+importance_per_feature = []
+for f in range(n_feat):
+    idxs = list(range(f, flat_len, n_feat))
+    importance_per_feature.append(perm.importances_mean[idxs].mean())
+
+imp_df = pd.DataFrame({"feature": feat_names, "importance": importance_per_feature}).sort_values("importance", ascending=False)
+print("Permutation importance (top):")
+print(imp_df.head(6))
+
+
+print("Computing SHAP values (small sample)...")
+background_size = min(30, X_train.shape[0])
+background = X_train[np.random.choice(X_train.shape[0], background_size, replace=False)]
+
+shap_values = None
+try:
+    expl = shap.GradientExplainer(model, background)
+    shap_values = expl.shap_values(X_test[:30])
+    print("Used GradientExplainer")
+except Exception as e:
+    print("GradientExplainer failed, falling back to KernelExplainer:", e)
+    def predict_flat(x_flat):
+        x3 = x_flat.reshape(-1, WINDOW, train_scaled.shape[1])
+        out = model.predict(x3, verbose=0).reshape(-1)
         return out
+    background_flat = background.reshape(background.shape[0], -1)
+    X_test_flat = X_test[:30].reshape(30, -1)
+    expl = shap.KernelExplainer(predict_flat, background_flat)
+    shap_vals_flat = expl.shap_values(X_test_flat, nsamples=100)
+    # kernel returns list or array; normalize to list with one array shaped (samples, time, features)
+    shap_values = [np.array(shap_vals_flat).reshape(30, WINDOW, train_scaled.shape[1])]
+
+arr = None
+if isinstance(shap_values, list):
+    # pick the first element as the array
+    arr = np.array(shap_values[0])
+else:
+    arr = np.array(shap_values)
+
+print("raw shap array shape:", arr.shape)
 
 
-class TransformerBlock(nn.Module):
-    def __init__(self, d_model, num_heads, dim_ff, dropout=0.1):
-        super().__init__()
-        self.attn = MultiHeadSelfAttention(d_model, num_heads, dropout=dropout)
-        self.ln1 = nn.LayerNorm(d_model)
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, dim_ff),
-            nn.ReLU(),
-            nn.Linear(dim_ff, d_model),
-        )
-        self.ln2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+if arr.ndim == 2:
+    # try to infer feature count; reshape to (samples, window, features)
+    arr = arr.reshape(arr.shape[0], WINDOW, -1)
+    print("reshaped shap to (samples, time, features):", arr.shape)
 
-    def forward(self, x, mask=None):
+
+if arr.ndim == 3 and arr.shape[2] != len(feat_names) and arr.shape[1] == len(feat_names):
+    arr = np.transpose(arr, (0,2,1))
+    print("transposed shap to (samples, time, features):", arr.shape)
+
+
+if not (arr.ndim == 3 and arr.shape[2] == len(feat_names)):
   
-        attn_out = self.attn(x, mask=mask)
-        x = self.ln1(x + self.dropout(attn_out))
-
-    
-        ff_out = self.ff(x)
-        x = self.ln2(x + self.dropout(ff_out))
-        return x
+    try:
+        arr = arr.reshape(arr.shape[0], WINDOW, len(feat_names))
+        print("fallback reshaped shap to:", arr.shape)
+    except Exception as e:
+        raise ValueError(f"Cannot interpret SHAP output shape {arr.shape} automatically.") from e
 
 
-class TimeSeriesTransformer(nn.Module):
+shap_abs = np.mean(np.abs(arr), axis=(0,1))  # result shape (n_features,)
+print("aggregated shap abs shape:", shap_abs.shape)
 
-    def __init__(self, d_model=64, num_heads=4, num_layers=2, dim_ff=128, seq_len=60):
-        super().__init__()
-        self.input_proj = nn.Linear(1, d_model)
-        self.pos_encoding = PositionalEncoding(d_model, max_len=seq_len + 10)
-        self.layers = nn.ModuleList(
-            [TransformerBlock(d_model, num_heads, dim_ff) for _ in range(num_layers)]
-        )
-        self.dropout = nn.Dropout(0.1)
-        self.fc_out = nn.Linear(d_model, 1)
-
-    def forward(self, x):
- 
-        x = self.input_proj(x)             
-        x = self.pos_encoding(x)           
-        for layer in self.layers:
-            x = layer(x)
-        x = self.dropout(x)
-
-        last_step = x[:, -1, :]            
-        out = self.fc_out(last_step)       
-        return out.squeeze(-1)
+shap_df = pd.DataFrame({"feature": feat_names, "shap_importance": shap_abs}).sort_values("shap_importance", ascending=False)
+print("SHAP importance (top):")
+print(shap_df.head(6))
 
 
-
-def rmse(y_true, y_pred):
-    return np.sqrt(np.mean((y_true - y_pred) ** 2))
-
-def mae(y_true, y_pred):
-    return np.mean(np.abs(y_true - y_pred))
-
-def mape(y_true, y_pred, eps=1e-8):
-    return np.mean(np.abs((y_true - y_pred) / (y_true + eps))) * 100.0
-
-
-
-
-def train_transformer_model(series,
-                            seq_len=60,
-                            horizon=1,
-                            batch_size=64,
-                            num_epochs=10,
-                            lr=1e-3,
-                            device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-    n = len(series)
-    train_end = int(0.7 * n)
-    val_end = int(0.85 * n)
-
-    train_series = series[:train_end]
-    val_series = series[train_end - seq_len - horizon + 1: val_end]
-    test_series = series[val_end - seq_len - horizon + 1:]
-
-    train_ds = TimeSeriesWindowDataset(train_series, seq_len, horizon)
-    val_ds = TimeSeriesWindowDataset(val_series, seq_len, horizon)
-    test_ds = TimeSeriesWindowDataset(test_series, seq_len, horizon)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
-
-    model = TimeSeriesTransformer(seq_len=seq_len).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
-
-    start_time = time.time()
-    for epoch in range(1, num_epochs + 1):
-        model.train()
-        train_losses = []
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            preds = model(xb)
-            loss = criterion(preds, yb)
-            loss.backward()
-            optimizer.step()
-            train_losses.append(loss.item())
-
-  
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                preds = model(xb)
-                loss = criterion(preds, yb)
-                val_losses.append(loss.item())
-
-        print(
-            f"Epoch {epoch:02d} | "
-            f"Train MSE: {np.mean(train_losses):.4f} | "
-            f"Val MSE: {np.mean(val_losses):.4f}"
-        )
-
-    train_time = time.time() - start_time
-
-
-    model.eval()
-    all_true, all_pred = [], []
-    with torch.no_grad():
-        for xb, yb in test_loader:
-            xb = xb.to(device)
-            preds = model(xb).cpu().numpy()
-            all_pred.append(preds)
-            all_true.append(yb.numpy())
-
-    all_true = np.concatenate(all_true)
-    all_pred = np.concatenate(all_pred)
-
-    transformer_metrics = {
-        "RMSE": rmse(all_true, all_pred),
-        "MAE": mae(all_true, all_pred),
-        "MAPE": mape(all_true, all_pred),
-        "train_time_sec": train_time,
-        "y_true": all_true,
-        "y_pred": all_pred,
-    }
-
-    return model, transformer_metrics, test_series, seq_len, horizon
-
-def sarima_baseline(series, order=(3, 1, 2), seasonal_order=(0, 0, 0, 0)):
-
-    n = len(series)
-    train_end = int(0.7 * n)
-    train_data = series[:train_end]
-    test_data = series[train_end:]
-
-    start_time = time.time()
-    model = SARIMAX(train_data,
-                    order=order,
-                    seasonal_order=seasonal_order,
-                    enforce_stationarity=False,
-                    enforce_invertibility=False)
-    sarima_res = model.fit(disp=False)
-    train_time = time.time() - start_time
-
-
-    sarima_forecast = sarima_res.forecast(steps=len(test_data))
-
-    y_true = test_data
-    y_pred = sarima_forecast
-
-    sarima_metrics = {
-        "RMSE": rmse(y_true, y_pred),
-        "MAE": mae(y_true, y_pred),
-        "MAPE": mape(y_true, y_pred),
-        "train_time_sec": train_time,
-        "y_true": np.asarray(y_true),
-        "y_pred": np.asarray(y_pred),
-    }
-
-    return sarima_metrics
-
-
-def main():
-
-    series = generate_synthetic_series(T=5000)
-
- 
-    print("\n=== Training Transformer model ===")
-    transformer_model, transformer_metrics, test_series, seq_len, horizon = \
-        train_transformer_model(series,
-                                seq_len=60,
-                                horizon=1,
-                                batch_size=64,
-                                num_epochs=15,  
-                                lr=1e-3)
-
-    print("\n=== Transformer performance on test set ===")
-    print(f"RMSE : {transformer_metrics['RMSE']:.4f}")
-    print(f"MAE  : {transformer_metrics['MAE']:.4f}")
-    print(f"MAPE : {transformer_metrics['MAPE']:.2f}%")
-    print(f"Train time: {transformer_metrics['train_time_sec']:.2f} sec")
-
-    print("\n=== Training SARIMA baseline ===")
-    sarima_metrics = sarima_baseline(series, order=(3, 1, 2), seasonal_order=(0, 0, 0, 0))
-
-    print("\n=== SARIMA performance on test set ===")
-    print(f"RMSE : {sarima_metrics['RMSE']:.4f}")
-    print(f"MAE  : {sarima_metrics['MAE']:.4f}")
-    print(f"MAPE : {sarima_metrics['MAPE']:.2f}%")
-    print(f"Train time: {sarima_metrics['train_time_sec']:.2f} sec")
-
-
-    print("\n=== Comparative Summary (Transformer vs SARIMA) ===")
-    for metric in ["RMSE", "MAE", "MAPE", "train_time_sec"]:
-        print(
-            f"{metric}: "
-            f"Transformer={transformer_metrics[metric]:.4f}, "
-            f"SARIMA={sarima_metrics[metric]:.4f}"
-        )
-
-
-if __name__ == "__main__":
-    main()
+common = set(imp_df.head(5)['feature']).intersection(set(shap_df.head(5)['feature']))
+print("\nCommon top features between Permutation and SHAP:", common)
+print("Done.")
